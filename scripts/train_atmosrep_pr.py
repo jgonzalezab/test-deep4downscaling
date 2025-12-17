@@ -7,6 +7,7 @@ MODELS_PATH = '/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/models'
 import xarray as xr
 import torch
 from torch.utils.data import DataLoader, random_split
+import numpy as np
 from importlib import reload
 
 import sys; sys.path.append('/gpfs/projects/meteo/WORK/gonzabad/deep4downscaling')
@@ -47,11 +48,15 @@ y_test = predictand.sel(time=slice(*years_test))
 # Standardize the predictors
 x_train_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_train)
 
+# Transform the predictand
+y_train = np.log1p(y_train)
+y_train_stand = deep4downscaling.trans.standardize(data_ref=y_train, data=y_train)
+
 # Set valid mask for the predictand
 y_mask = deep4downscaling.trans.compute_valid_mask(y_train)
 
 # Stack the predictand and the mask
-y_train_stack = y_train.stack(gridpoint=('lat', 'lon'))
+y_train_stack = y_train_stand.stack(gridpoint=('lat', 'lon'))
 y_mask_stack = y_mask.stack(gridpoint=('lat', 'lon'))
 
 # Filter the predictand and the mask to only include valid grid points
@@ -61,7 +66,7 @@ y_train_stack_filt = y_train_stack.where(y_train_stack['gridpoint'] == y_mask_st
 
 # Set loss function
 reload(deep4downscaling.deep.loss)
-loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True)
+loss_function = deep4downscaling.deep.loss.AtmoRepLoss(ignore_nans=True)
 
 # Convert the data to numpy arrays
 x_train_stand_arr = deep4downscaling.trans.xarray_to_numpy(x_train_stand)
@@ -78,15 +83,14 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
                               shuffle=True)
 
 # Create models
-model_name = 'deepesd_crps_pr'
+model_name = 'deepesd_multihead_pr'
 
 reload(deep4downscaling.deep.models)
-model = deep4downscaling.deep.models.NoisyDeepESD(x_shape=x_train_stand_arr.shape,
-                                                  y_shape=y_train_arr.shape,
-                                                  num_channels_noise=10,
-                                                  filters_last_conv=1,
-                                                  members_for_training=10,
-                                                  last_relu=False)
+model = deep4downscaling.deep.models.DeepESDMultiHead(x_shape=x_train_stand_arr.shape,
+                                                      y_shape=y_train_arr.shape,
+                                                      filters_last_conv=1,
+                                                      num_heads=10,
+                                                      last_relu=False)
 
 # Set device
 device = ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -116,14 +120,18 @@ model.load_state_dict(torch.load(f'{MODELS_PATH}/{model_name}.pt',
 x_test_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_test)
 
 # Compute predictions
-pred_test = deep4downscaling.deep.pred.compute_preds_standard(
-                                x_data=x_test_stand, model=model,
-                                device=device, var_target='pr',
-                                ensemble_size=4,
-                                mask=y_mask, batch_size=16)
+time_to_plot = 550
+
+reload(deep4downscaling.deep.pred)
+pred_test = deep4downscaling.deep.pred.compute_preds_multihead(x_data=x_test_stand.isel(time=[time_to_plot]), model=model,
+                                                               device=device, var_target='pr',
+                                                               mask=y_mask, batch_size=None)
+
+# Undo log transformation of the predictions
+pred_test = deep4downscaling.trans.undo_standardization(data_ref=y_train, data=pred_test)
+pred_test = np.expm1(pred_test)
 
 # Visualize target and predictions
-time_to_plot = 800
 
 # Target
 deep4downscaling.viz.simple_map_plot(data=y_test.isel(time=time_to_plot),
@@ -133,40 +141,19 @@ deep4downscaling.viz.simple_map_plot(data=y_test.isel(time=time_to_plot),
 
 # 4 different predictions (different ensemble members)
 for member in range(4):
-    deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=time_to_plot, member=member),
+    deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0, member=member),
                                          colorbar='hot_r', var_to_plot='pr',
                                          vlimits=(0, 16),
                                          output_path=f'{FIGURES_PATH}/pred_member{member+1}.pdf')
 
-# Compute and visualize metrics
-# RMSE
-rmse = deep4downscaling.metrics.rmse(target=y_test, pred=pred_test.isel(member=0),
-                                     var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=rmse,
-                                     colorbar='YlOrRd', var_to_plot='pr',
-                                     vlimits=(0, 5),
-                                     output_path=f'{FIGURES_PATH}/rmse.pdf')
+# Plot mean of members
+deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0).mean(dim='member'),
+                                     colorbar='hot_r', var_to_plot='pr',
+                                     vlimits=(0, 16),
+                                     output_path=f'{FIGURES_PATH}/pred_mean.pdf')
 
-# Bias mean
-bias_mean = deep4downscaling.metrics.bias_rel_mean(target=y_test, pred=pred_test.isel(member=0),
-                                               var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_mean,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-20, 20),
-                                     output_path=f'{FIGURES_PATH}/bias_mean.pdf')
-
-# Bias r01
-bias_rel_r01 = deep4downscaling.metrics.bias_rel_R01(target=y_test, pred=pred_test.isel(member=0),
-                                                     var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_rel_r01,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-40, 40),
-                                     output_path=f'{FIGURES_PATH}/bias_r01.pdf')
-
-# Bias rx1day
-bias_rel_rx1day = deep4downscaling.metrics.bias_rel_rx1day(target=y_test, pred=pred_test.isel(member=0),
-                                                           var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_rel_rx1day,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-60, 60),
-                                     output_path=f'{FIGURES_PATH}/bias_rx1day.pdf')
+# Plot std of members
+deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0).std(dim='member'),
+                                     colorbar='hot_r', var_to_plot='pr',
+                                     vlimits=(0, 8),
+                                     output_path=f'{FIGURES_PATH}/pred_std.pdf')
