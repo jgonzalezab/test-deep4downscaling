@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, random_split
 from importlib import reload
 
 import sys; sys.path.append('/gpfs/projects/meteo/WORK/gonzabad/deep4downscaling')
+sys.path.append('/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/src')
 import deep4downscaling.viz
 import deep4downscaling.trans
 import deep4downscaling.deep.loss
@@ -19,6 +20,7 @@ import deep4downscaling.deep.train
 import deep4downscaling.deep.pred
 import deep4downscaling.metrics
 import deep4downscaling.metrics_ccs
+import utils as utils
 
 # Load predictors
 predictor_filename = f'{DATA_PATH}/ERA5_NorthAtlanticRegion_1-5dg_full.nc'
@@ -61,7 +63,7 @@ y_train_stack_filt = y_train_stack.where(y_train_stack['gridpoint'] == y_mask_st
 
 # Set loss function
 reload(deep4downscaling.deep.loss)
-loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True)
+loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=False)
 
 # Convert the data to numpy arrays
 x_train_stand_arr = deep4downscaling.trans.xarray_to_numpy(x_train_stand)
@@ -70,6 +72,18 @@ y_train_arr = deep4downscaling.trans.xarray_to_numpy(y_train_stack_filt)
 # Create Dataset
 train_dataset = deep4downscaling.deep.utils.StandardDataset(x=x_train_stand_arr,
                                                             y=y_train_arr)
+
+# Split into training and validation sets
+train_dataset, valid_dataset = random_split(train_dataset,
+                                            [0.9, 0.1])
+
+# Create DataLoaders
+batch_size = 64
+
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
+                              shuffle=True)
+valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size,
+                              shuffle=True)
 
 # Create DataLoaders
 batch_size = 64
@@ -83,9 +97,9 @@ model_name = 'deepesd_crps_pr'
 reload(deep4downscaling.deep.models)
 model = deep4downscaling.deep.models.NoisyDeepESD(x_shape=x_train_stand_arr.shape,
                                                   y_shape=y_train_arr.shape,
-                                                  num_channels_noise=10,
+                                                  num_channels_noise=3,
                                                   filters_last_conv=1,
-                                                  members_for_training=10,
+                                                  members_for_training=2,
                                                   last_relu=False)
 
 # Set device
@@ -96,8 +110,9 @@ from torchsummary import summary
 summary(model.to(device), x_train_stand_arr.shape[1:])
 
 # Set hyperparameters
-num_epochs = 1000
+num_epochs = 400
 learning_rate = 0.0001
+patience_early_stopping = 100
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 # Train model
@@ -122,51 +137,10 @@ pred_test = deep4downscaling.deep.pred.compute_preds_standard(
                                 ensemble_size=4,
                                 mask=y_mask, batch_size=16)
 
-# Visualize target and predictions
-time_to_plot = 800
-
-# Target
-deep4downscaling.viz.simple_map_plot(data=y_test.isel(time=time_to_plot),
-                                     colorbar='hot_r', var_to_plot='pr',
-                                     vlimits=(0, 16),
-                                     output_path=f'{FIGURES_PATH}/target.pdf')
-
-# 4 different predictions (different ensemble members)
-for member in range(4):
-    deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=time_to_plot, member=member),
-                                         colorbar='hot_r', var_to_plot='pr',
-                                         vlimits=(0, 16),
-                                         output_path=f'{FIGURES_PATH}/pred_member{member+1}.pdf')
-
-# Compute and visualize metrics
-# RMSE
-rmse = deep4downscaling.metrics.rmse(target=y_test, pred=pred_test.isel(member=0),
-                                     var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=rmse,
-                                     colorbar='YlOrRd', var_to_plot='pr',
-                                     vlimits=(0, 5),
-                                     output_path=f'{FIGURES_PATH}/rmse.pdf')
-
-# Bias mean
-bias_mean = deep4downscaling.metrics.bias_rel_mean(target=y_test, pred=pred_test.isel(member=0),
-                                               var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_mean,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-20, 20),
-                                     output_path=f'{FIGURES_PATH}/bias_mean.pdf')
-
-# Bias r01
-bias_rel_r01 = deep4downscaling.metrics.bias_rel_R01(target=y_test, pred=pred_test.isel(member=0),
-                                                     var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_rel_r01,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-40, 40),
-                                     output_path=f'{FIGURES_PATH}/bias_r01.pdf')
-
-# Bias rx1day
-bias_rel_rx1day = deep4downscaling.metrics.bias_rel_rx1day(target=y_test, pred=pred_test.isel(member=0),
-                                                           var_target='pr')
-deep4downscaling.viz.simple_map_plot(data=bias_rel_rx1day,
-                                     colorbar='BrBG', var_to_plot='pr',
-                                     vlimits=(-60, 60),
-                                     output_path=f'{FIGURES_PATH}/bias_rx1day.pdf')
+# Visualize predictions
+reload(utils)
+utils.evaluate_and_save_plots(target=y_test,
+                              pred=pred_test,
+                              output_path=f'{FIGURES_PATH}/evaluation_crps_pr.pdf',
+                              time_to_plot=800,
+                              n_members=4)
