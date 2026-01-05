@@ -85,12 +85,6 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
 valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size,
                               shuffle=True)
 
-# Create DataLoaders
-batch_size = 64
-
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True)
-
 # Create models
 model_name = 'deepesd_crps_pr'
 

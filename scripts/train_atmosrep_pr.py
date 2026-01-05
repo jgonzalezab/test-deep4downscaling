@@ -11,6 +11,7 @@ import numpy as np
 from importlib import reload
 
 import sys; sys.path.append('/gpfs/projects/meteo/WORK/gonzabad/deep4downscaling')
+sys.path.append('/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/src')
 import deep4downscaling.viz
 import deep4downscaling.trans
 import deep4downscaling.deep.loss
@@ -20,6 +21,7 @@ import deep4downscaling.deep.train
 import deep4downscaling.deep.pred
 import deep4downscaling.metrics
 import deep4downscaling.metrics_ccs
+import utils as utils
 
 # Load predictors
 predictor_filename = f'{DATA_PATH}/ERA5_NorthAtlanticRegion_1-5dg_full.nc'
@@ -49,8 +51,9 @@ y_test = predictand.sel(time=slice(*years_test))
 x_train_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_train)
 
 # Transform the predictand
-y_train = np.log1p(y_train)
-y_train_stand = deep4downscaling.trans.standardize(data_ref=y_train, data=y_train)
+y_train_mean = y_train.mean()
+y_train_std = y_train.std()
+y_train_stand = (y_train - y_train_mean) / y_train_std
 
 # Set valid mask for the predictand
 y_mask = deep4downscaling.trans.compute_valid_mask(y_train)
@@ -76,10 +79,16 @@ y_train_arr = deep4downscaling.trans.xarray_to_numpy(y_train_stack_filt)
 train_dataset = deep4downscaling.deep.utils.StandardDataset(x=x_train_stand_arr,
                                                             y=y_train_arr)
 
+# Split into training and validation sets
+train_dataset, valid_dataset = random_split(train_dataset,
+                                            [0.9, 0.1])
+
 # Create DataLoaders
 batch_size = 64
 
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
+                              shuffle=True)
+valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size,
                               shuffle=True)
 
 # Create models
@@ -88,7 +97,7 @@ model_name = 'deepesd_multihead_pr'
 reload(deep4downscaling.deep.models)
 model = deep4downscaling.deep.models.DeepESDMultiHead(x_shape=x_train_stand_arr.shape,
                                                       y_shape=y_train_arr.shape,
-                                                      filters_last_conv=1,
+                                                      filters_last_conv=5,
                                                       num_heads=10,
                                                       last_relu=False)
 
@@ -101,6 +110,7 @@ summary(model.to(device), x_train_stand_arr.shape[1:])
 
 # Set hyperparameters
 num_epochs = 1000
+patience_early_stopping = 60
 learning_rate = 0.0001
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -109,7 +119,8 @@ train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(
                             model=model, model_name=model_name, model_path=MODELS_PATH,
                             device=device, num_epochs=num_epochs,
                             loss_function=loss_function, optimizer=optimizer,
-                            train_data=train_dataloader,
+                            train_data=train_dataloader, valid_data=valid_dataloader,
+                            patience_early_stopping=patience_early_stopping,
                             mixed_precision=True)
 
 # Load the model weights into the DeepESD architecture
@@ -119,41 +130,19 @@ model.load_state_dict(torch.load(f'{MODELS_PATH}/{model_name}.pt',
 # Standardize
 x_test_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_test)
 
-# Compute predictions
-time_to_plot = 550
-
+# Compute predictions for full test dataset
 reload(deep4downscaling.deep.pred)
-pred_test = deep4downscaling.deep.pred.compute_preds_multihead(x_data=x_test_stand.isel(time=[time_to_plot]), model=model,
+pred_test = deep4downscaling.deep.pred.compute_preds_multihead(x_data=x_test_stand, model=model,
                                                                device=device, var_target='pr',
                                                                mask=y_mask, batch_size=None)
 
 # Undo log transformation of the predictions
-pred_test = deep4downscaling.trans.undo_standardization(data_ref=y_train, data=pred_test)
-pred_test = np.expm1(pred_test)
+pred_test = pred_test * y_train_std + y_train_mean
 
-# Visualize target and predictions
-
-# Target
-deep4downscaling.viz.simple_map_plot(data=y_test.isel(time=time_to_plot),
-                                     colorbar='hot_r', var_to_plot='pr',
-                                     vlimits=(0, 16),
-                                     output_path=f'{FIGURES_PATH}/target.pdf')
-
-# 4 different predictions (different ensemble members)
-for member in range(4):
-    deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0, member=member),
-                                         colorbar='hot_r', var_to_plot='pr',
-                                         vlimits=(0, 16),
-                                         output_path=f'{FIGURES_PATH}/pred_member{member+1}.pdf')
-
-# Plot mean of members
-deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0).mean(dim='member'),
-                                     colorbar='hot_r', var_to_plot='pr',
-                                     vlimits=(0, 16),
-                                     output_path=f'{FIGURES_PATH}/pred_mean.pdf')
-
-# Plot std of members
-deep4downscaling.viz.simple_map_plot(data=pred_test.isel(time=0).std(dim='member'),
-                                     colorbar='hot_r', var_to_plot='pr',
-                                     vlimits=(0, 8),
-                                     output_path=f'{FIGURES_PATH}/pred_std.pdf')
+# Visualize predictions
+reload(utils)
+utils.evaluate_and_save_plots(target=y_test,
+                              pred=pred_test,
+                              output_path=f'{FIGURES_PATH}/evaluation_atmosrep_pr.pdf',
+                              time_to_plot=800,
+                              n_members=4)
