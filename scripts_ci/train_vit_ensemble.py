@@ -146,19 +146,19 @@ for member_idx in range(n_ensemble_members):
     # Create model
     model = deep4downscaling.deep.models.ViT(x_shape=x_train_stand_arr.shape,
                                              y_shape=y_train_arr.shape,
-                                             patch_size=4,
+                                             patch_size=2,
                                              dim=768,
-                                             depth=4,
-                                             num_heads=4,
+                                             depth=12,
+                                             num_heads=12,
                                              mlp_dim=3072,
                                              orog=None,
                                              last_relu=False,
                                              stochastic=True)
 
     # Wrap the model for multi-GPU training if available
-    # if torch.cuda.device_count() > 1:
-    #     print(f"Using {torch.cuda.device_count()} GPUs!")
-    #     model = torch.nn.DataParallel(model)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
     model.to(device)
     
     

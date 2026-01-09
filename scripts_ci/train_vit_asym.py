@@ -132,7 +132,8 @@ model = deep4downscaling.deep.models.ViT(x_shape=x_train_stand_arr.shape,
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs!")
     model = torch.nn.DataParallel(model)
-    
+model.to(device)
+
 # Set hyperparameters
 num_epochs = 10000
 learning_rate = 0.0001

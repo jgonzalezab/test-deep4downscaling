@@ -111,10 +111,10 @@ model_name = f'vit_{uncertainty_approach}'
 # Create model
 model = deep4downscaling.deep.models.NoisyViT(x_shape=x_train_stand_arr.shape,
                                               y_shape=y_train_arr.shape,
-                                              patch_size=4,
+                                              patch_size=2,
                                               dim=768,
-                                              depth=4,
-                                              num_heads=4,
+                                              depth=12,
+                                              num_heads=12,
                                               mlp_dim=3072,
                                               noise_channels=3,
                                               noise_dim=768,
@@ -122,6 +122,12 @@ model = deep4downscaling.deep.models.NoisyViT(x_shape=x_train_stand_arr.shape,
                                               orog=None,
                                               last_relu=True)
     
+# Wrap the model for multi-GPU training if available
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs!")
+    model = torch.nn.DataParallel(model)
+model.to(device)
+
 # Set hyperparameters
 num_epochs = 10000
 learning_rate = 0.0001
