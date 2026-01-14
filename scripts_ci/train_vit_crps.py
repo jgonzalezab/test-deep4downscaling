@@ -140,6 +140,7 @@ loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
 # Train the model
+# To avoid CRPS degeneration training must be performed with gradient clipping
 train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(model=model, 
                                                                           model_name=model_name, 
                                                                           model_path=MODELS_PATH,
