@@ -4,6 +4,7 @@ FIGURES_PATH = '/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/figures
 MODELS_PATH = '/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/models'
 
 # Import libraries
+import os
 import xarray as xr
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ import deep4downscaling.deep.loss
 import deep4downscaling.deep.utils
 import deep4downscaling.deep.models
 import deep4downscaling.deep.train
+import deep4downscaling.deep.tracker
 import deep4downscaling.deep.pred
 import deep4downscaling.metrics
 import deep4downscaling.metrics_ccs
@@ -62,7 +64,7 @@ predictor = deep4downscaling.trans.remove_days_with_nans(predictor)
 predictor, predictand = deep4downscaling.trans.align_datasets(predictor, predictand, 'time')
 
 # Split data into training and test sets
-years_train = ('1980', '2010')
+years_train = ('1980', '1982') # Computational limitations
 years_test = ('2011', '2020')
 
 x_train = predictor.sel(time=slice(*years_train))
@@ -79,11 +81,12 @@ y_train_stack = y_train.stack(gridpoint=('lat', 'lon'))
 
 # Set loss function
 reload(deep4downscaling.deep.loss)
-loss_function = deep4downscaling.deep.loss.CRPSSpectralLoss(ignore_nans=True,
-                                                            H_shape=256,
-                                                            W_shape=256,
-                                                            beta=1,
-                                                            lambda_spectral=0.05)
+loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True, beta=1)
+# loss_function = deep4downscaling.deep.loss.CRPSSpectralLoss(ignore_nans=False,
+#                                                             H_shape=256,
+#                                                             W_shape=256,
+#                                                             lambda_spectral=0.1,
+#                                                             spatial_resolution=10)
 
 # Convert the data to numpy arrays
 x_train_stand_arr = deep4downscaling.trans.xarray_to_numpy(x_train_stand)
@@ -98,7 +101,7 @@ train_dataset, valid_dataset = random_split(train_dataset,
                                             [0.9, 0.1])
 
 # Create DataLoaders
-batch_size = 64
+batch_size = 2 # Computational limitations
 
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
                               shuffle=True)
@@ -113,10 +116,10 @@ model = deep4downscaling.deep.models.NoisyViT(x_shape=x_train_stand_arr.shape,
                                               y_shape=y_train_arr.shape,
                                               patch_size=2,
                                               dim=768,
-                                              depth=12,
-                                              num_heads=12,
+                                              depth=2,
+                                              num_heads=2,
                                               mlp_dim=3072,
-                                              noise_channels=3,
+                                              noise_channels=256,
                                               noise_dim=768,
                                               members_for_training=2,
                                               orog=None,
@@ -130,15 +133,30 @@ if torch.cuda.device_count() > 1:
 model.to(device)
 
 # Torch summary
-from torchsummary import summary
-summary(model if not isinstance(model, torch.nn.DataParallel) else model.module, 
-        x_train_stand_arr.shape[1:])
+# from torchsummary import summary
+# summary(model if not isinstance(model, torch.nn.DataParallel) else model.module, 
+#         x_train_stand_arr.shape[1:])
 
 # Set hyperparameters
-num_epochs = 1000
+num_epochs = 15
 learning_rate = 0.0001
 patience_early_stopping = 60
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# Create tracker for monitoring training progress
+tracker = deep4downscaling.deep.tracker.TrainingTracker(
+    experiment_dir='/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/experiments',
+    experiment_name=model_name,
+    log_every=1,
+    num_samples=4,
+    flip_ud=True)
+
+# Full training checkpoints (model, optimizer, AMP scaler, loss history) are written to
+# {MODELS_PATH}/{model_name}_checkpoint.pt when save_checkpoint_every is set.
+# To test resume: run once, then set resume_checkpoint to that path and increase num_epochs.
+save_checkpoint_every = None
+resume_checkpoint = f'{MODELS_PATH}/{model_name}_checkpoint.pt'
+# Example after a partial run: resume_checkpoint = os.path.join(MODELS_PATH, f'{model_name}_checkpoint.pt')
 
 # Train model
 train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(model=model, model_name=model_name, model_path=MODELS_PATH,
@@ -147,7 +165,11 @@ train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(model=
                                                                           train_data=train_dataloader,
                                                                           valid_data=valid_dataloader,
                                                                           patience_early_stopping=patience_early_stopping,
-                                                                          mixed_precision=True)
+                                                                          mixed_precision=True,
+                                                                          save_checkpoint_every=save_checkpoint_every,
+                                                                          resume_checkpoint=None,
+                                                                          clip_gradients_norm=1.0,
+                                                                          tracker=tracker)
 
 # Load the model weights into the ViT architecture
 model.load_state_dict(torch.load(f'{MODELS_PATH}/{model_name}.pt', 

@@ -15,6 +15,7 @@ import deep4downscaling.deep.loss
 import deep4downscaling.deep.utils
 import deep4downscaling.deep.models
 import deep4downscaling.deep.train
+import deep4downscaling.deep.tracker
 import deep4downscaling.deep.pred
 import deep4downscaling.metrics
 import deep4downscaling.metrics_ccs
@@ -48,6 +49,7 @@ x_train_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_trai
 
 # Set valid mask for the predictand
 y_mask = deep4downscaling.trans.compute_valid_mask(y_train)
+y_spatial_mask = deep4downscaling.trans.xarray_to_numpy(y_mask)
 
 # Stack the predictand and the mask
 y_train_stack = y_train.stack(gridpoint=('lat', 'lon'))
@@ -99,13 +101,24 @@ optimizer = torch.optim.Adam(model.parameters(),
 # Set device
 device = ('cuda' if torch.cuda.is_available() else 'cpu')
 
+# Create tracker for monitoring training progress
+tracker = deep4downscaling.deep.tracker.TrainingTracker(experiment_dir='/gpfs/projects/meteo/WORK/gonzabad/test-deep4downscaling/experiments',
+                                                        experiment_name='deepesd_pr',
+                                                        log_every=5,
+                                                        num_samples=4,
+                                                        spatial_mask=y_spatial_mask,
+                                                        flip_ud=True)
+
 # Train model
 train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(
                             model=model, model_name=model_name, model_path=MODELS_PATH,
                             device=device, num_epochs=num_epochs,
                             loss_function=loss_function, optimizer=optimizer,
                             train_data=train_dataloader, valid_data=valid_dataloader,
-                            patience_early_stopping=patience_early_stopping)
+                            patience_early_stopping=patience_early_stopping,
+                            tracker=tracker)
+
+print(stop)
 
 # Load the model weights into the DeepESD architecture
 model.load_state_dict(torch.load(f'{MODELS_PATH}/{model_name}.pt', 
