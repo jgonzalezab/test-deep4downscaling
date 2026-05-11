@@ -45,7 +45,6 @@ dlat = np.diff(lat).mean()
 n_extra = 32 - lat.size
 new_lat = np.concatenate([lat, lat[-1] + dlat * np.arange(1, n_extra + 1)])
 predictor = predictor.reindex(lat=new_lat, method='nearest')
-predictor = predictor.load()
 
 # Load predictand
 predictand_filename = f'{DATA_PATH}/pr_AEMET.nc'
@@ -83,12 +82,21 @@ y_test = predictand.sel(time=slice(*years_test))
 # Standardize the predictors
 x_train_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_train)
 
-# Stack the predictand
+# Set valid mask for the predictand
+y_mask = deep4downscaling.trans.compute_valid_mask(y_train)
+
+# Stack the predictand and the mask
 y_train_stack = y_train.stack(gridpoint=('lat', 'lon'))
+y_mask_stack = y_mask.stack(gridpoint=('lat', 'lon'))
+
+# Filter the predictand and the mask to only include valid grid points
+y_mask_stack_filt = y_mask_stack.where(y_mask_stack==1, drop=True)
+y_train_stack_filt = y_train_stack.where(y_train_stack['gridpoint'] == y_mask_stack_filt['gridpoint'],
+                                         drop=True)
 
 # Convert the data to numpy arrays
 x_train_stand_arr = deep4downscaling.trans.xarray_to_numpy(x_train_stand)
-y_train_arr = deep4downscaling.trans.xarray_to_numpy(y_train_stack)
+y_train_arr = deep4downscaling.trans.xarray_to_numpy(y_train_stack_filt)
 
 # Create Dataset
 train_dataset = deep4downscaling.deep.utils.StandardDataset(x=x_train_stand_arr,
@@ -99,7 +107,7 @@ train_dataset, valid_dataset = random_split(train_dataset,
                                             [0.9, 0.1])
 
 # Create DataLoaders
-batch_size = 64
+batch_size = 2
 
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size,
                               shuffle=True)
@@ -107,26 +115,81 @@ valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size,
                               shuffle=True)
 
 # Set model name
-model_name = f'vit_{uncertainty_approach}_n0'
+model_name = f'deepesdv2_{uncertainty_approach}'
+
+# Number of output grid points
+n_out = y_train_arr.shape[1]
+
+patch_size = 2
+
+# Prepare decoder grid coordinates for NeRF positional encoding
+# Normalize lat/lon to [-1, 1] based on the region's extent
+d0 = y_train_stack_filt['lat'].values.astype(np.float64)
+d1 = y_train_stack_filt['lon'].values.astype(np.float64)
+
+lat_min, lat_max = d0.min(), d0.max()
+lon_min, lon_max = d1.min(), d1.max()
+
+d0_norm = 2.0 * (d0 - lat_min) / (lat_max - lat_min) - 1.0
+d1_norm = 2.0 * (d1 - lon_min) / (lon_max - lon_min) - 1.0
+
+grid_coords = torch.tensor(np.stack([d0_norm, d1_norm], axis=-1),
+                            dtype=torch.float32)
+print(f"NeRF positional encoding (decoder): using {grid_coords.shape[0]} grid coordinates "
+      f"(normalized to [-1, 1] based on region)")
+
+# Prepare encoder grid coordinates (patch centers) for NeRF positional encoding
+first_var = next(iter(predictor.data_vars))
+pred_spatial_dims = [d for d in predictor[first_var].dims if d != 'time']
+dim0 = predictor[pred_spatial_dims[0]].values.astype(np.float64)
+dim1 = predictor[pred_spatial_dims[1]].values.astype(np.float64)
+n_h = len(dim0) // patch_size
+n_w = len(dim1) // patch_size
+
+patch_coords = np.empty((n_h * n_w, 2))
+for i in range(n_h):
+    for j in range(n_w):
+        patch_coords[i * n_w + j, 0] = dim0[i * patch_size:(i + 1) * patch_size].mean()
+        patch_coords[i * n_w + j, 1] = dim1[j * patch_size:(j + 1) * patch_size].mean()
+
+enc_lat_min, enc_lat_max = patch_coords[:, 0].min(), patch_coords[:, 0].max()
+enc_lon_min, enc_lon_max = patch_coords[:, 1].min(), patch_coords[:, 1].max()
+
+patch_coords[:, 0] = 2.0 * (patch_coords[:, 0] - enc_lat_min) / (enc_lat_max - enc_lat_min) - 1.0
+patch_coords[:, 1] = 2.0 * (patch_coords[:, 1] - enc_lon_min) / (enc_lon_max - enc_lon_min) - 1.0
+
+encoder_grid_coords = torch.tensor(patch_coords, dtype=torch.float32)
+print(f"NeRF positional encoding (encoder): using {encoder_grid_coords.shape[0]} patch centers "
+      f"(normalized to [-1, 1] based on region)")
 
 # Create model
-model = deep4downscaling.deep.models.NoisyViT(x_shape=x_train_stand_arr.shape,
-                                              y_shape=y_train_arr.shape,
-                                              patch_size=2,
-                                              dim=768,
-                                              depth=12,
-                                              num_heads=12,
-                                              mlp_dim=3072,
-                                              noise_channels=3,
-                                              noise_dim=768,
-                                              members_for_training=2,
-                                              orog=None,
-                                              last_relu=True)
+model = deep4downscaling.deep.models.NoisyDeepESDv2(x_shape=x_train_stand_arr.shape,
+                                                    n_out=n_out,
+                                                    patch_size=patch_size,
+                                                    dim=128,
+                                                    depth=4,
+                                                    num_heads=4,
+                                                    mlp_dim=256,
+                                                    decoder_depth=1,
+                                                    noise_channels=3,
+                                                    noise_dim=128,
+                                                    query_dim=128,
+                                                    decoder_cross_attn_mlp=False,
+                                                    grid_coords=grid_coords,
+                                                    encoder_grid_coords=encoder_grid_coords,
+                                                    nerf_num_frequencies=8,
+                                                    share_nerf_encoding=False,
+                                                    members_for_training=2,
+                                                    last_relu=True)
 
-# Torch summary
 from torchsummary import summary
-summary(model if not isinstance(model, torch.nn.DataParallel) else model.module, 
-        x_train_stand_arr.shape[1:])                                              
+
+print("Model Summary:")
+model.to(device)
+if isinstance(model, torch.nn.DataParallel):
+    summary(model.module, input_size=x_train_stand_arr.shape[1:], device=device)
+else:
+    summary(model, input_size=x_train_stand_arr.shape[1:], device=device)
     
 # Wrap the model for multi-GPU training if available
 if torch.cuda.device_count() > 1:
@@ -146,7 +209,6 @@ loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
 # Train the model
-# To avoid CRPS degeneration training must be performed with gradient clipping
 train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(model=model, 
                                                                           model_name=model_name, 
                                                                           model_path=MODELS_PATH,
@@ -165,10 +227,7 @@ model.load_state_dict(torch.load(f'{MODELS_PATH}/{model_name}.pt', weights_only=
 # Standardize the test data
 x_test_stand = deep4downscaling.trans.standardize(data_ref=x_train, data=x_test)
 
-# Compute mask
-y_mask = deep4downscaling.trans.compute_valid_mask(y_test)
-
-# Compute predictions
+# Compute predictions (use the y_train-based mask to match the filtered model output)
 pred_test = deep4downscaling.deep.pred.compute_preds_standard(x_data=x_test_stand, model=model, device=device,
                                                               ensemble_size=10, var_target='pr', mask=y_mask, batch_size=16)
 

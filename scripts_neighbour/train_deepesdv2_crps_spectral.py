@@ -26,7 +26,7 @@ import deep4downscaling.metrics_ccs
 import utils as utils
 
 # Uncertainty approach
-uncertainty_approach = 'CRPS'
+uncertainty_approach = 'CRPS_spectral'
 
 # Set device
 device = 'cuda'
@@ -45,7 +45,6 @@ dlat = np.diff(lat).mean()
 n_extra = 32 - lat.size
 new_lat = np.concatenate([lat, lat[-1] + dlat * np.arange(1, n_extra + 1)])
 predictor = predictor.reindex(lat=new_lat, method='nearest')
-predictor = predictor.load()
 
 # Load predictand
 predictand_filename = f'{DATA_PATH}/pr_AEMET.nc'
@@ -107,46 +106,48 @@ valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size,
                               shuffle=True)
 
 # Set model name
-model_name = f'vit_{uncertainty_approach}_n0'
+model_name = f'deepesdv2_{uncertainty_approach}'
+
+# Number of output grid points
+n_out = y_train_arr.shape[1]
 
 # Create model
-model = deep4downscaling.deep.models.NoisyViT(x_shape=x_train_stand_arr.shape,
-                                              y_shape=y_train_arr.shape,
-                                              patch_size=2,
-                                              dim=768,
-                                              depth=12,
-                                              num_heads=12,
-                                              mlp_dim=3072,
-                                              noise_channels=3,
-                                              noise_dim=768,
-                                              members_for_training=2,
-                                              orog=None,
-                                              last_relu=True)
+model = deep4downscaling.deep.models.NoisyDeepESDv2(x_shape=x_train_stand_arr.shape,
+                                                    n_out=n_out,
+                                                    patch_size=2,
+                                                    dim=768,
+                                                    depth=12,
+                                                    num_heads=12,
+                                                    mlp_dim=3072,
+                                                    decoder_depth=2,
+                                                    noise_channels=3,
+                                                    noise_dim=768,
+                                                    query_dim=768,
+                                                    members_for_training=2,
+                                                    last_relu=True)
 
-# Torch summary
-from torchsummary import summary
-summary(model if not isinstance(model, torch.nn.DataParallel) else model.module, 
-        x_train_stand_arr.shape[1:])                                              
-    
 # Wrap the model for multi-GPU training if available
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs!")
     model = torch.nn.DataParallel(model)
 model.to(device)
-
+    
 # Set hyperparameters
 num_epochs = 10000
 learning_rate = 0.0001
 patience_early_stopping = 40
 
 # Set loss function
-loss_function = deep4downscaling.deep.loss.CRPSLoss(ignore_nans=True)
+loss_function = deep4downscaling.deep.loss.CRPSSpectralLoss(ignore_nans=True,
+                                                            H_shape=256,
+                                                            W_shape=256,
+                                                            beta=1,
+                                                            lambda_spectral=0.05)
 
 # Initialize optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
 # Train the model
-# To avoid CRPS degeneration training must be performed with gradient clipping
 train_loss, val_loss = deep4downscaling.deep.train.standard_training_loop(model=model, 
                                                                           model_name=model_name, 
                                                                           model_path=MODELS_PATH,
